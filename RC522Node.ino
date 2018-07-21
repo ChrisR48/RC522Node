@@ -1,11 +1,11 @@
-
-
 /**
    ----------------------------------------------------------------------------
    This is a RC522Node; see https://github.com/ChrisR48/RC522Node
    for further details
 
-   NOTE: The node uses MFRC522 library from: https://github.com/miguelbalboa/rfid
+   NOTE:
+   The node uses MFRC522 library from: https://github.com/miguelbalboa/rfid
+   For Serial Command, this library is used: https://github.com/joshmarinacci/CmdArduino
 
    Typical pin layout used:
    -----------------------------------------------------------------------------------------
@@ -19,6 +19,25 @@
    SPI MISO    MISO         12 / ICSP-1   50        D12        ICSP-1           14
    SPI SCK     SCK          13 / ICSP-3   52        D13        ICSP-3           15
 
+  Installation nodes:
+
+   go to https://github.com/miguelbalboa/rfid and install the latest version into Arduino IDE
+   go to https://github.com/joshmarinacci/CmdArduino and install the latest version into Arduino IDE
+
+  Command Line:
+
+  *************** CMD *******************
+  CMD >> help
+  usage: command [parameter ...]
+    commands:
+     * help: prints this help text
+     * clear: clears eeprom data
+     * write: write data to tag
+     * cancel: cancel write
+     * read: read reference data from eeprom
+     * store: store reference data in eeprom
+     * status: print status information
+
 */
 
 
@@ -28,6 +47,8 @@
 #include <MFRC522Extended.h>
 #include <require_cpp11.h>
 #include <EEPROM.h>
+
+#include <Cmd.h>
 
 #define LED_ON LOW
 #define LED_OFF HIGH
@@ -44,11 +65,166 @@ const uint8_t RST_PIN = 9;
 
 MFRC522 mfrc522(SS_PIN, RST_PIN);    // Create MFRC522 instance.
 
-MFRC522::MIFARE_Key key;
-
 bool refDataSet = false;
 byte refData;
 
+bool writeNextTag = false;
+byte writeData;
+
+bool readRef = false;
+
+bool tagMatches = false;
+unsigned long tagMatchesTime = 0;
+
+bool buttonPressed = false;
+
+boolean tag_present = false;
+unsigned long tag_present_time = 0;
+boolean tag_read = false;
+
+//**************************** CLI START ***************
+
+const char* CMD_HELP    = "help";
+const char* CMD_CLEAR   = "clear";
+const char* CMD_WRITE   = "write";
+const char* CMD_READ    = "read";
+const char* CMD_STORE   = "store";
+const char* CMD_CANCEL  = "cancel";
+const char* CMD_STATUS  = "status";
+
+void help(int arg_cnt, char **args) {
+  Serial.println(F("usage: command [parameter ...]"));
+  Serial.println(F("  commands:"));
+  Serial.print(F("   * ")); Serial.print(CMD_HELP);   Serial.println(F(": prints this help text"));
+  Serial.print(F("   * ")); Serial.print(CMD_CLEAR);  Serial.println(F(": clears eeprom data"));
+  Serial.print(F("   * ")); Serial.print(CMD_WRITE);  Serial.println(F(": write data to tag"));
+  Serial.print(F("   * ")); Serial.print(CMD_CANCEL); Serial.println(F(": cancel write"));
+  Serial.print(F("   * ")); Serial.print(CMD_READ);   Serial.println(F(": read reference data from eeprom"));
+  Serial.print(F("   * ")); Serial.print(CMD_STORE);  Serial.println(F(": store reference data in eeprom"));
+  Serial.print(F("   * ")); Serial.print(CMD_STATUS); Serial.println(F(": print status information"));
+}
+
+void clearEEPROM(int arg_cnt, char **args) {
+  Serial.print(F("Clearing eeprom"));
+  EEPROM.write(1, 0);
+  refDataSet = false;
+}
+
+void readEEPROM(int arg_cnt, char **args) {
+  Serial.print(F("Reference Data: "));
+  if (refDataSet) {
+    Serial.println(refData, HEX);
+  } else {
+    Serial.println(F("Not Set"));
+  }
+}
+
+void writeEEPROM(int arg_cnt, char **args) {
+
+  if (arg_cnt != 2) {
+    Serial.println("Invalid argument count for store");
+    Serial.println("Usage: store DATA");
+    return;
+  }
+
+  String param(args[1]);
+
+  if (param.length() != 1) {
+    Serial.println("Invalid parameter, must be one character");
+    return;
+  }
+
+  refData = (byte) param.charAt(0);
+
+  Serial.print(F("Writing to eeprom: "));
+  Serial.println((char) refData);
+
+  writeConfig();
+}
+
+void writeToTag(int arg_cnt, char **args) {
+  if (arg_cnt != 2) {
+    Serial.println("Invalid argument count for write");
+    Serial.println("Usage: write DATA");
+    return;
+  }
+
+  String param(args[1]);
+
+  if (param.length() != 1) {
+    Serial.println("Invalid parameter, must be one character");
+    return;
+  }
+
+  writeData = (byte) param.charAt(0);
+
+  Serial.print(F("Writing to next tag: "));
+  Serial.println(writeData, HEX);
+  writeNextTag = true;
+
+}
+
+void cancel(int arg_cnt, char **args) {
+  Serial.print(F("Writing canceled"));
+  writeNextTag = false;
+}
+
+void status(int arg_cnt, char **args) {
+  Serial.println(F("STATUS INFO:"));
+  Serial.print(F("  Reference Data "));
+  if (refDataSet) {
+    Serial.println(F("set"));
+  } else {
+    Serial.println(F("not set"));
+  }
+  Serial.print(F("  Write Tag "));
+  if (writeNextTag) {
+    Serial.println(F("active"));
+  } else {
+    Serial.println(F("NOT active"));
+  }
+
+  Serial.print(F("  Button "));
+  if (buttonPressed) {
+    Serial.println(F("pressed"));
+  } else {
+    Serial.println(F("released"));
+  }
+
+  Serial.print(F("  Tag "));
+  if (tag_present) {
+    if (tag_read) {
+      if (tagMatches) {
+        Serial.println(F("matching"));
+      } else {
+        Serial.println(F("NOT matching"));
+      }
+    } else {
+      Serial.println(F("NOT read"));
+    }
+  } else {
+    Serial.println(F("NOT present"));
+
+  }
+}
+//**************************** CLI END ****************
+
+//**************************** EEPROM START ***********
+
+void writeConfig() {
+  if (EEPROM.read(1) != 48) {
+    EEPROM.write(1, 48);
+  }
+
+  if (EEPROM.read(2) != refData) {
+    EEPROM.write(2, refData);
+  }
+  refDataSet = true;
+}
+
+//**************************** EEPROM DONE ***********
+
+//**************************** SETUP START ***********
 
 void setup() {
 
@@ -62,6 +238,15 @@ void setup() {
 
   Serial.begin(9600); // Initialize serial communications with the PC
   while (!Serial);    // Do nothing if no serial port is opened (added for Arduinos based on ATMEGA32U4)
+
+  cmdInit(&Serial);
+  cmdAdd(CMD_HELP, help);
+  cmdAdd(CMD_CLEAR, clearEEPROM);
+  cmdAdd(CMD_WRITE, writeToTag);
+  cmdAdd(CMD_READ, readEEPROM);
+  cmdAdd(CMD_STORE, writeEEPROM);
+  cmdAdd(CMD_CANCEL, cancel);
+  cmdAdd(CMD_STATUS, status);
 
   Serial.println(F("System start."));
 
@@ -95,65 +280,12 @@ void setup() {
 
   Serial.println(F("Startup completed"));
 
-  // Prepare the key (used both as key A and as key B)
-  // using FFFFFFFFFFFFh which is the default at chip delivery from the factory
-  for (byte i = 0; i < 6; i++) {
-    key.keyByte[i] = 0xFF;
-  }
 }
 
-bool writeNextTag = false;
-byte writeData;
 
-bool readRef = false;
+//**************************** SETUP DONE ************
 
-bool tagMatches = false;
-unsigned long tagMatchesTime = 0;
-
-void writeConfig() {
-  if (EEPROM.read(1) != 48) {
-    EEPROM.write(1, 48);
-  }
-
-  if (EEPROM.read(2) != refData) {
-    EEPROM.write(2, refData);
-  }
-  refDataSet = true;
-}
-
-void checkCommand() {
-  if (Serial.available() > 3) {
-    Serial.println(F("Start of command found"));
-    if (Serial.read() == '$') {
-      char c = Serial.read();
-      if ( c == 'r') {
-        Serial.print(F("Reference Data: "));
-        if (refDataSet) {
-          Serial.println(refData, HEX);
-        } else {
-          Serial.println(F("Not Set"));
-        }
-      } else if (c == 'w') {
-        if (!readRef) {
-          Serial.print(F("Writing to next tag: "));
-          byte data = Serial.read();
-          writeData = data; 
-          Serial.println(writeData, HEX);
-          writeNextTag = true;
-        } else {
-          Serial.println(F("Skipped writing as read reference is still active"));
-        }
-      } else if (c == 'c') {
-        if (writeNextTag) {
-          Serial.print(F("Writing canceled"));
-          writeNextTag = false;
-        }
-      }
-    }
-  }
-}
-
-bool buttonPressed = false;
+//**************************** BUTTON START **********
 
 void checkButton() {
 
@@ -181,95 +313,17 @@ void checkButton() {
 
 }
 
-bool tagPresent() {
+//**************************** BUTTON END ************
 
-  // Look for new cards
-  if ( !mfrc522.PICC_IsNewCardPresent()) {
-    return false;
-  }
-
-  //Serial.println(F("MFRC522 Card Present"));
-
-  // Select one of the cards
-  if ( ! mfrc522.PICC_ReadCardSerial())
-    return false;
-
-  //Serial.println(F("MFRC522 Read Serial Successful"));
-
-  MFRC522::PICC_Type piccType = mfrc522.PICC_GetType(mfrc522.uid.sak);
-
-  if (piccType != MFRC522::PICC_Type::PICC_TYPE_MIFARE_UL) {
-    Serial.println(F("Tag failure. Only working with MIFARE Ultralight!"));
-    return false;
-  }
-
-  return true;
-}
-
-void controlLED() {
-
-  if (tagMatches) {
-    digitalWrite(OUTPUT_TAG, LED_ON);
-  } else {
-    digitalWrite(OUTPUT_TAG, LED_OFF);
-  }
-
-  if (!refDataSet || writeNextTag || readRef) {
-    digitalWrite(OUTPUT_NODE, LED_OFF);
-  } else {
-    digitalWrite(OUTPUT_NODE, LED_ON);
-  }
-}
-
-void loop() {
-
-  checkCommand();
-
-  checkButton();
-
-  controlLED();
-
-  if (tagPresent()) {
-    if (writeNextTag) {
-      if (writeTag(writeData)) {
-        Serial.println(F("Tag write successful"));
-        writeNextTag = false;
-      }
-    } else {
-      byte data;
-      if (readTag(data)) {
-        if (readRef) {
-          Serial.println(F("Tag read successful"));
-          Serial.println(data, HEX);
-          refData = data;
-          writeConfig();
-          readRef = false;
-        } else if (refDataSet) {
-          tagMatches = (data == refData);
-          tagMatchesTime = millis();
-        }
-
-      }
-    }
-  }
-
-  if (tagMatches && (millis() - tagMatchesTime > 1000)) {
-    tagMatches = false;
-  }
-}
+//**************************** TAG START *************
 
 bool readTag(byte &data) {
-  Serial.println(F("readTag()"));
   byte buffer[18]; //We need to read 4 pages at once with crc
   byte byteCount = sizeof(buffer);
   MFRC522::StatusCode result = mfrc522.MIFARE_Read(6,  buffer, &byteCount); //Address 6 is first page for user data
 
   if (result == MFRC522::STATUS_OK ) {
-    //dump_byte_array(buffer, byteCount);
-    Serial.print(F("data:"));
     data = buffer[0];
-    Serial.println(data, HEX);
-
     return true;
   }
 
@@ -277,9 +331,6 @@ bool readTag(byte &data) {
 }
 
 bool writeTag(byte data) {
-
-  Serial.println(F("writeTag()"));
-
   byte buffer[4];
   byte byteCount = sizeof(buffer);
 
@@ -301,14 +352,118 @@ bool writeTag(byte data) {
 
 }
 
+bool tagPresent() {
 
-/**
-   Helper routine to dump a byte array as hex values to Serial.
-*/
-void dump_byte_array(byte *buffer, byte bufferSize) {
-  for (byte i = 0; i < bufferSize; i++) {
-    Serial.print(buffer[i] < 0x10 ? " 0" : " ");
-    Serial.print(buffer[i], HEX);
+  if (tag_present & (millis() - tag_present_time > 500)) {
+    Serial.println(F("Tag removed"));
+    tag_present = false;
+    tag_read = false;
+    tagMatches = false;
   }
+
+  // Look for new cards
+  if ( !mfrc522.PICC_IsNewCardPresent()) {
+    return false;
+  }
+
+  // Select one of the cards
+  if ( ! mfrc522.PICC_ReadCardSerial()) {
+    return false;
+  }
+
+  if (!tag_present) {
+    Serial.println(F("New Tag present"));
+  }
+  tag_present = true;
+  tag_present_time = millis();
+
+  MFRC522::PICC_Type piccType = mfrc522.PICC_GetType(mfrc522.uid.sak);
+
+  if (piccType != MFRC522::PICC_Type::PICC_TYPE_MIFARE_UL) {
+    Serial.println(F("Tag failure. Only working with MIFARE Ultralight!"));
+    return false;
+  }
+
+  return true;
+}
+
+
+void controlTag() {
+  if (tagPresent()) {
+    if (writeNextTag) {
+      if (writeTag(writeData)) {
+        Serial.println(F("Tag write successful"));
+        writeNextTag = false;
+      }
+    } else {
+      byte data;
+      if (readTag(data)) {
+        if (readRef) {
+          Serial.println(F("Tag read successful"));
+          Serial.println(data, HEX);
+          refData = data;
+          writeConfig();
+          readRef = false;
+        } else {
+
+          if (!tag_read) {
+            Serial.print(F("Tag data: "));
+            Serial.println((char) data);
+          }
+          tag_read = true;
+
+          if (refDataSet) {
+            boolean match = (data == refData);
+
+            if (tagMatches != match) {
+              if (match) {
+                Serial.println(F("Found matching tag"));
+              } else {
+                Serial.println(F("Matching tag removed"));
+              }
+
+            }
+            tagMatches = match;
+            if (match) {
+              tagMatchesTime = millis();
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+//**************************** TAG DONE **************
+
+//**************************** LED START *************
+
+void controlLED() {
+
+  if (tagMatches) {
+    digitalWrite(OUTPUT_TAG, LED_ON);
+  } else {
+    digitalWrite(OUTPUT_TAG, LED_OFF);
+  }
+
+  if (!refDataSet || writeNextTag || readRef) {
+    digitalWrite(OUTPUT_NODE, LED_OFF);
+  } else {
+    digitalWrite(OUTPUT_NODE, LED_ON);
+  }
+}
+
+//**************************** LED START *************
+
+void loop() {
+
+  cmdPoll();
+
+  checkButton();
+
+  controlLED();
+
+  controlTag();
+
 }
 
